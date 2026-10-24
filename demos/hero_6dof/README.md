@@ -1,4 +1,7 @@
-# 6DoF README hero
+# Synthetic 6DoF hero
+
+The README now uses the [real-data hero](../real_data_hero/README.md).
+This synthetic scenario remains reproducible at `images/hero_localization.gif`.
 
 A **seeded synthetic illustration** using the installed Autoware integration
 launch and the actual ROS 2 ESKF output. This is not a real-data benchmark,

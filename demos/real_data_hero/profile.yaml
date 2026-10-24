@@ -1,0 +1,19 @@
+# Real Odaiba first-180s demonstration: source parameters are the existing
+# urbannav_tokyo_tuned regression profile, with these explicit 6DoF overrides.
+ekf_localization:
+  ros__parameters:
+    use_flat_ground: false
+    use_nonholonomic_constraint: false
+    wheel_speed_use_nonholonomic_constraints: false
+    use_imu_orientation: false
+    output_stamp_source: imu
+    input_qos_depth: 10000
+    output_qos_depth: 10000
+    input_reorder_window_sec: 2000.0
+    input_reorder_drain_sleep_usec: 500
+    initial_position_variance_xy: 0.01
+    initial_position_variance_z: 0.01
+    initial_velocity_variance_xy: 0.04
+    initial_velocity_variance_z: 0.04
+    initial_attitude_variance_rp: 0.0004
+    initial_attitude_variance_yaw: 0.0004

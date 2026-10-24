@@ -1,0 +1,113 @@
+{
+  "dataset": "UrbanNav-TK-20181219 Odaiba",
+  "kind": "real sensor data; regression/demo split",
+  "position_3d_rmse_m": 1.194148048489376,
+  "max_position_3d_error_m": 5.023628589245521,
+  "attitude_geodesic_rmse_deg": 2.749598168015008,
+  "max_attitude_geodesic_error_deg": 10.771474382783845,
+  "gnss_position_3d_rmse_m": 1.4633163938401115,
+  "gnss_metric_sampling": "GNSS solution epochs; estimator metric uses IMU output epochs",
+  "output_samples": 8999,
+  "matched_output_samples": 8994,
+  "reference_match_ratio": 0.9994443827091899,
+  "excluded_endpoint_samples": 5,
+  "reference_gap_max_sec": 0.10000014305114746,
+  "gnss_solution_gap_max_sec": 5.0,
+  "gnss_solution_gaps": [
+    [
+      92.59066200256348,
+      97.59066200256348
+    ],
+    [
+      130.39066219329834,
+      134.39066219329834
+    ],
+    [
+      145.19066214561462,
+      148.9906620979309
+    ]
+  ],
+  "start": 1229226975.009338,
+  "duration": 179.99010109901428,
+  "constraints": "no flat-ground or nonholonomic constraints",
+  "alignment": "none; common ENU origin; reference-derived initial pose only",
+  "caveat": "No published Tokyo extrinsic/lever-arm calibration; identity body mounting assumed",
+  "source_sha256": {
+    "prepared/reference.csv": "e730426d36c9f2492a3ae9d1226824dbf29d953d1c6d8e3251f79de474b83c85",
+    "prepared/estimate.csv": "b9772a660a792053011844d3a9baf73d94b99f51258901c53935999cb8f2c9ed",
+    "prepared/observations.csv": "064c5a20c56fdc9d85deda64bb5882548e53da34f612de35a654688370ff0944",
+    "prepared/scenario.json": "eaf763c163e1a93f9d2c614edcb2d73f463d80770fd524f0273c1cf400641239",
+    "results/manifest.json": "e468b0234c9a516687a7c26aee8de44ea97cf11479108606db39c81f1250db9e",
+    "results/configs/wheel.yaml": "3aa6bd46b33980b3293d4545c0697953afaacebb8306ae7610d1bf30fd8156e8"
+  },
+  "render_sha256": "2f1020a60e3472f48a73ede48e28aba1c44769373e07858cb2c538a66989b39e",
+  "runner_manifest_schema": 2,
+  "published_date": "2026-10-24",
+  "input_counts": {
+    "imu": 8999,
+    "wheel": 8999,
+    "gnss": 838,
+    "seed": 20
+  },
+  "rtklib_commit": "71db0ffa0d9735697c6adfd06fdf766d0e5ce807",
+  "dataset_license_commit": "e53717a40c94803cd479a140433f6d803b1a0876",
+  "repeatability": "Two independent estimator replays produced identical estimate CSV SHA-256",
+  "estimate_csv_sha256": "b9772a660a792053011844d3a9baf73d94b99f51258901c53935999cb8f2c9ed",
+  "downloaded_member_manifest": {
+    "source": "https://github.com/IPNL-POLYU/UrbanNavDataset#tokyo-dataset",
+    "archive_url": "https://dl.dropboxusercontent.com/scl/fi/b0d7jilvpjxf8h471iqvb/Tokyo_Data.zip?rlkey=z1qjhr84nb6ahxypvy6fn5ow6",
+    "archive_bytes": 4452177524,
+    "transferred_bytes": 23845046,
+    "files": [
+      {
+        "member": "Tokyo_Data/Odaiba/base.nav",
+        "bytes": 6916149,
+        "crc32": "3a9f4111",
+        "sha256": "c58bd7ecaf7c7a0766fa9bc23ba7b0666172c28c95a13c35ac973f88b2645b35"
+      },
+      {
+        "member": "Tokyo_Data/Odaiba/base_trimble.obs",
+        "bytes": 10911525,
+        "crc32": "76b10eaf",
+        "sha256": "5cc6c8d205530deeba6e7b37c3ff002d54ace69ecfd994e1a4b90683e0c165ee"
+      },
+      {
+        "member": "Tokyo_Data/Odaiba/imu.csv",
+        "bytes": 7095682,
+        "crc32": "6eb616b8",
+        "sha256": "4ce830a7e8b55fc8845a3df4ded7bb14394113c8be9c7c2e1afa412957583584"
+      },
+      {
+        "member": "Tokyo_Data/Odaiba/reference.csv",
+        "bytes": 3023844,
+        "crc32": "4aafdd2b",
+        "sha256": "fbf3f0054df8e68d7552d1e930221a80bfba45ea37703b64c7abf148750c301d"
+      },
+      {
+        "member": "Tokyo_Data/Odaiba/rover_trimble.obs",
+        "bytes": 71151487,
+        "crc32": "f2f81f6b",
+        "sha256": "3ebb5c4f95a7a399900109a6b1086f7f359c593abdeb07a453e18f5b2f7e0ee8"
+      },
+      {
+        "member": "Tokyo_Data/Odaiba/rover_ublox.obs",
+        "bytes": 27699610,
+        "crc32": "aaaded3e",
+        "sha256": "7541282f75349063dadb2338c921ac80f11eb9aa28d181d43692387279c2837f"
+      }
+    ],
+    "selected_split": "Odaiba regression/demo; not the Shinjuku holdout"
+  },
+  "artifact_sha256": {
+    "hero.gif": "00cde51404737b0f926b0af97675ef26a5cdf17b077641502971d0f9c4aa423c",
+    "hero.mp4": "d993af1806f09f824e5fd8ac3d2ba59f716f5061ce432c245bf04e017d5224c6"
+  },
+  "animation": {
+    "width": 1120,
+    "height": 700,
+    "fps": 20,
+    "duration_sec": 16,
+    "frames": 320
+  },
+  "init_reference_use": "reference first orientation; zero position in reference-origin ENU"
+}

@@ -1,6 +1,6 @@
 # Planar baseline (previous README hero)
 
-The current README uses the [6DoF hero](../hero_6dof/README.md). This
+The current README uses the [real-data hero](../real_data_hero/README.md). This
 planar baseline remains reproducible at `images/hero_localization_planar.gif`.
 
 A seeded **synthetic illustration**, driven by the actual ROS 2 ESKF node.

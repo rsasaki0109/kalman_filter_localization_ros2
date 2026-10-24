@@ -150,6 +150,10 @@ The [6DoF hero](../demos/hero_6dof/README.md) now covers a synthetic spatial
 component scenario using the real integration launch: banked turns, varying
 height, rotated IMU mounting, delayed poses and a 12 s pose outage. Its physical
 input and output/error gates pass. The previous planar hero remains reproducible.
+A [real Odaiba regression demo](../demos/real_data_hero/README.md) also replays
+measured IMU/wheel data and independently processed rover GNSS with planar
+constraints disabled. Its initialization/frame assumptions and all measured errors
+are disclosed; it is not the registered blind holdout.
 Full Autoware/Nav2 navigation and public real-data holdouts remain required before
 stack compatibility or general accuracy claims.
 

@@ -1,9 +1,9 @@
 # Kalman Filter Localization
 
-![6DoF ROS 2 ESKF on a climbing, banked course through a 12-second absolute-pose outage](images/hero_localization.gif)
+![Real UrbanNav Odaiba GNSS, IMU and wheel-speed data replayed through the ROS 2 ESKF](images/hero_localization_real.gif)
 
-*Synthetic inputs · actual ROS 2 estimator output · 12 s absolute-pose outage · no planar constraints.*
-[Reproduce the 6DoF demo](demos/hero_6dof/README.md) · [Measured results](demos/hero_6dof/published_metrics.json)
+*Real UrbanNav Odaiba data (MIT) · actual ROS 2 output · reference-seeded initialization.*
+[Reproduce the real-data demo](demos/real_data_hero/README.md) · [Full measured results and assumptions](demos/real_data_hero/published_metrics.json) · [Synthetic 6DoF demo](demos/hero_6dof/README.md)
 
 A 6DoF error-state EKF for ROS 2, fusing IMU, absolute pose and velocity
 observations, with GNSS and odometry input modes. It estimates position, velocity,
