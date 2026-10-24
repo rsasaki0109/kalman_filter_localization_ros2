@@ -1,7 +1,16 @@
 ekf_localization:
     ros__parameters:
+      start_active: true  # Autoware integration launch starts inactive
       reference_frame_id: "map"
       robot_frame_id: "base_link"
+      initial_pose_covariance_mode: "diagonal"  # "full" rejects invalid 6x6 covariance
+      # Optional full 6DoF body pose, with fixed-reference-axis 6x6 covariance.
+      pose_measurement_topic: ""
+      pose_measurement_timeout_sec: 1.0
+      max_pose_nis: 0.0  # 0 disables the joint 6-dimensional NIS gate
+      twist_measurement_topic: ""
+      twist_linear_axes: [x, y, z]  # observed SOURCE-frame axes only
+      max_twist_nis: 0.0  # body linear velocity (3-dimensional gate)
       gnss_pose_topic: "gnss_pose"
       gnss_input_type: "pose"  # "pose" or "navsatfix"
       gnss_navsatfix_topic: "/gnss/fix"
@@ -38,6 +47,10 @@ ekf_localization:
       pub_period: 10
       output_odometry_topic: "/current_odometry"
       publish_tf: false
+      # "reference_to_odom" composes a timestamp-aligned global TF with an
+      # external odom->base_link provider (e.g. Nav2 local odometry).
+      tf_output_mode: "reference_to_base"
+      odom_frame_id: "odom"
       var_imu_w: 0.01
       var_imu_acc: 0.01
       use_continuous_process_noise_density: false

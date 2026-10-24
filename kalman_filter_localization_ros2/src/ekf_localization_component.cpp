@@ -47,6 +47,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -60,6 +61,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -69,6 +71,7 @@
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <rclcpp/qos.hpp>
@@ -84,6 +87,9 @@
 #include <kalman_filter_localization/core/measurement_quality.hpp>
 #include <kalman_filter_localization/core/odometry.hpp>
 #include <kalman_filter_localization/core/sensor_fault_monitor.hpp>
+#include <kalman_filter_localization/core/state_output.hpp>
+#include <kalman_filter_localization/core/state_initialization.hpp>
+#include <kalman_filter_localization/core/twist_input.hpp>
 #include <kalman_filter_localization/core/vehicle_model.hpp>
 #include <kalman_filter_localization/core/vehicle_observability.hpp>
 #include <kalman_filter_localization_msgs/msg/estimator_status.hpp>
@@ -262,6 +268,10 @@ const char * measurementSourceText(const int source)
       return "zupt";
     case 7:
       return "zihr";
+    case 8:
+      return "pose_6d";
+    case 9:
+      return "twist_linear";
     default:
       return "unknown";
   }
@@ -489,6 +499,12 @@ struct EkfLocalizationComponent::Impl
     const double latest_imu_time = has_latest_imu_stamp_ ?
       latest_imu_stamp_.seconds() : std::numeric_limits<double>::quiet_NaN();
     const auto covariance = ekf_.getCovariance();
+    const bool pose_input_enabled = !pose_measurement_topic_.empty();
+    const double pose_age = has_accepted_pose_measurement_ ?
+      node_.now().seconds() - latest_pose_measurement_time_ :
+      std::numeric_limits<double>::quiet_NaN();
+    const bool pose_available = has_accepted_pose_measurement_ && std::isfinite(pose_age) &&
+      pose_age >= -1.0e-3 && pose_age <= pose_measurement_timeout_sec_;
     const auto isFresh = [filter_time](
       const bool has_stamp, const double stamp, const double timeout) {
         if (!has_stamp || !std::isfinite(filter_time) || !std::isfinite(stamp)) {
@@ -517,14 +533,23 @@ struct EkfLocalizationComponent::Impl
     const bool odom_aid_available = use_odom_ && !odom_isolated;
     const bool vehicle_aid_available = wheel_aid_available || odom_aid_available;
     const bool numerical_ok = ekf_.checkNumericalInvariants();
-    const bool initialized = initial_pose_received_ && has_received_input_ &&
+    const bool initialized = active_ && initial_pose_received_ && has_received_input_ &&
+      has_latest_imu_stamp_ &&
       (!enable_stationary_initialization_ || stationary_initialization_complete_);
 
     using StatusMessage = kalman_filter_localization_msgs::msg::EstimatorStatus;
     StatusMessage message;
-    message.header.stamp = has_latest_imu_stamp_ ? latest_imu_stamp_ : node_.now();
+    // Status describes this assessment, including watchdog ticks without IMU.
+    // Filter/sample timestamps remain explicit fields below.
+    message.header.stamp = node_.now();
     message.header.frame_id = reference_frame_id_;
     message.initialized = initialized;
+    message.active = active_;
+    message.pose_input_enabled = pose_input_enabled;
+    message.pose_available = pose_available;
+    message.pose_age_sec = pose_age;
+    message.received_pose_measurements = received_pose_measurement_count_;
+    message.received_twist_measurements = received_twist_measurement_count_;
     message.stationary =
       stationary_detector_.state() == core::StationaryDetector::State::kStationary;
     message.gnss_available = !use_gnss_ || (!gnss_isolated && gnss_available);
@@ -569,13 +594,13 @@ struct EkfLocalizationComponent::Impl
       message.rewind_count = replay_->counters().rewind_count;
     }
 
-    if (!initial_pose_received_ || !has_received_input_) {
+    if (!active_ || !initial_pose_received_ || !has_received_input_ || !has_latest_imu_stamp_) {
       message.health = StatusMessage::HEALTH_UNKNOWN;
       message.mode = StatusMessage::MODE_UNINITIALIZED;
       message.health_text = "unknown";
       message.mode_text = "uninitialized";
-      message.summary = initial_pose_received_ ? "waiting_for_sensor_input" :
-        "waiting_for_initial_pose";
+      message.summary = !active_ ? "inactive" :
+        (initial_pose_received_ ? "waiting_for_sensor_input" : "waiting_for_initial_pose");
     } else if (enable_stationary_initialization_ && !stationary_initialization_complete_) {
       message.health = StatusMessage::HEALTH_DEGRADED;
       message.mode = StatusMessage::MODE_INITIALIZING;
@@ -636,7 +661,20 @@ struct EkfLocalizationComponent::Impl
       message.mode = StatusMessage::MODE_OPEN_SKY;
       message.health_text = "ok";
       message.mode_text = "open_sky";
-      message.summary = "gnss_imu_fusion";
+      message.summary = pose_input_enabled ? "pose_imu_fusion" :
+        (!twist_measurement_topic_.empty() ? "twist_imu_fusion" : "gnss_imu_fusion");
+    }
+    // Pose freshness overrides a stationary/OK mode but cannot downgrade an
+    // existing sensor/numerical FAULT or conceal the initialization phase.
+    if (initialized && pose_input_enabled && !pose_available &&
+      message.health != StatusMessage::HEALTH_FAULT)
+    {
+      message.health = StatusMessage::HEALTH_DEGRADED;
+      message.mode = StatusMessage::MODE_OUTAGE;
+      message.health_text = "degraded";
+      message.mode_text = "outage";
+      message.summary = has_accepted_pose_measurement_ ? "pose_input_stale" :
+        "waiting_for_pose_input";
     }
     estimator_status_pub_->publish(message);
 
@@ -662,6 +700,9 @@ struct EkfLocalizationComponent::Impl
       addKeyValue("mode", message.mode_text);
       addKeyValue("gnss_available", message.gnss_available ? "true" : "false");
       addKeyValue("wheel_available", message.wheel_available ? "true" : "false");
+      addKeyValue("pose_input_enabled", message.pose_input_enabled ? "true" : "false");
+      addKeyValue("pose_available", message.pose_available ? "true" : "false");
+      addKeyValue("pose_age_sec", std::to_string(message.pose_age_sec));
       addKeyValue("sensor_fault_isolation_enabled",
         message.sensor_fault_isolation_enabled ? "true" : "false");
       addKeyValue("imu_isolated", message.imu_isolated ? "true" : "false");
@@ -744,6 +785,19 @@ struct EkfLocalizationComponent::Impl
   {
     const double arrival_time = node_.now().seconds();
     const std::int64_t stamp_nanoseconds = stampToNanoseconds(stamp);
+    if (!active_ || awaiting_reset_seed_) {
+      // An explicit reset starts a new epoch. Do not let old sensor traffic
+      // establish a reorder watermark before the next valid seed.
+      if (priority == 0) {process();}
+      return;
+    }
+    if (priority > 0 && initial_pose_received_ &&
+      stamp_nanoseconds < initialization_stamp_nanoseconds_)
+    {
+      RCLCPP_WARN_THROTTLE(
+        node_.get_logger(), clock_, 5000, "skip input older than last initialization");
+      return;
+    }
     if (!(input_reorder_window_sec_ > 0.0)) {
       const double filter_time_before = filterTimeForDebug();
       process();
@@ -785,13 +839,6 @@ struct EkfLocalizationComponent::Impl
       attitude_variance,
       Eigen::Vector3d::Constant(initial_imu_gyro_bias_covariance_),
       Eigen::Vector3d::Constant(initial_imu_acc_bias_covariance_));
-  }
-
-  bool applyInitialCovariance(
-    const Eigen::Vector3d & position_variance,
-    const Eigen::Vector3d & attitude_variance)
-  {
-    return applyInitialCovarianceTo(ekf_, position_variance, attitude_variance);
   }
 
   bool applyConfiguredInitialCovarianceTo(core::EKFEstimator & estimator)
@@ -856,6 +903,8 @@ struct EkfLocalizationComponent::Impl
 
   void init()
   {
+    node_.declare_parameter("start_active", true);
+    node_.get_parameter("start_active", active_);
     node_.declare_parameter("reference_frame_id", "map");
     node_.get_parameter("reference_frame_id", reference_frame_id_);
     node_.declare_parameter("robot_frame_id", "base_link");
@@ -864,6 +913,42 @@ struct EkfLocalizationComponent::Impl
     node_.get_parameter("initial_pose_topic", initial_pose_topic_);
     node_.declare_parameter("initial_pose_covariance_topic", std::string());
     node_.get_parameter("initial_pose_covariance_topic", initial_pose_covariance_topic_);
+    node_.declare_parameter("initial_pose_covariance_mode", "diagonal");
+    node_.get_parameter("initial_pose_covariance_mode", initial_pose_covariance_mode_);
+    if (initial_pose_covariance_mode_ != "diagonal" && initial_pose_covariance_mode_ != "full") {
+      throw std::invalid_argument("initial_pose_covariance_mode must be diagonal or full");
+    }
+    node_.declare_parameter("pose_measurement_topic", std::string());
+    node_.get_parameter("pose_measurement_topic", pose_measurement_topic_);
+    node_.declare_parameter("pose_measurement_timeout_sec", 1.0);
+    node_.get_parameter("pose_measurement_timeout_sec", pose_measurement_timeout_sec_);
+    if (!std::isfinite(pose_measurement_timeout_sec_) || pose_measurement_timeout_sec_ <= 0.0) {
+      throw std::invalid_argument("pose_measurement_timeout_sec must be finite and positive");
+    }
+    node_.declare_parameter("twist_measurement_topic", std::string());
+    node_.get_parameter("twist_measurement_topic", twist_measurement_topic_);
+    node_.declare_parameter("twist_linear_axes", std::vector<std::string>{"x", "y", "z"});
+    std::vector<std::string> axes;
+    node_.get_parameter("twist_linear_axes", axes);
+    twist_observed_axes_.fill(false);
+    for (const auto & axis : axes) {
+      const int index = axis == "x" ? 0 : (axis == "y" ? 1 : (axis == "z" ? 2 : -1));
+      if (index < 0 || twist_observed_axes_[index]) {
+        throw std::invalid_argument("twist_linear_axes requires unique x/y/z names");
+      }
+      twist_observed_axes_[index] = true;
+    }
+    if (axes.empty()) {throw std::invalid_argument("twist_linear_axes must not be empty");}
+    node_.declare_parameter("max_twist_nis", 0.0);
+    node_.get_parameter("max_twist_nis", max_twist_nis_);
+    if (!std::isfinite(max_twist_nis_) || max_twist_nis_ < 0.0) {
+      throw std::invalid_argument("max_twist_nis must be finite and nonnegative");
+    }
+    node_.declare_parameter("max_pose_nis", 0.0);
+    node_.get_parameter("max_pose_nis", max_pose_nis_);
+    if (!std::isfinite(max_pose_nis_) || max_pose_nis_ < 0.0) {
+      throw std::invalid_argument("max_pose_nis must be finite and nonnegative");
+    }
     node_.declare_parameter("imu_topic", node_.get_name() + std::string("/imu"));
     node_.get_parameter("imu_topic", imu_topic_);
     node_.declare_parameter("odom_topic", node_.get_name() + std::string("/odom"));
@@ -1274,6 +1359,21 @@ struct EkfLocalizationComponent::Impl
     node_.get_parameter("output_odometry_topic", output_odometry_topic_);
     node_.declare_parameter("publish_tf", false);
     node_.get_parameter("publish_tf", publish_tf_);
+    node_.declare_parameter("tf_output_mode", "reference_to_base");
+    node_.get_parameter("tf_output_mode", tf_output_mode_);
+    node_.declare_parameter("odom_frame_id", "odom");
+    node_.get_parameter("odom_frame_id", odom_frame_id_);
+    if (tf_output_mode_ != "reference_to_base" && tf_output_mode_ != "reference_to_odom") {
+      throw std::invalid_argument("tf_output_mode must be reference_to_base or reference_to_odom");
+    }
+    if (tf_output_mode_ == "reference_to_odom" &&
+      (reference_frame_id_.empty() || robot_frame_id_.empty() ||
+      reference_frame_id_ == robot_frame_id_ ||
+      odom_frame_id_.empty() || odom_frame_id_ == reference_frame_id_ ||
+      odom_frame_id_ == robot_frame_id_))
+    {
+      throw std::invalid_argument("reference_to_odom requires three distinct, nonempty TF frames");
+    }
     if (
       output_stamp_source_ != "latest_input" &&
       output_stamp_source_ != "imu" &&
@@ -2051,7 +2151,18 @@ struct EkfLocalizationComponent::Impl
       node_.create_publisher<geometry_msgs::msg::PoseStamped>(
       output_pose_name, rclcpp::QoS(output_qos_depth_));
     current_odometry_pub_ =
-      node_.create_publisher<nav_msgs::msg::Odometry>(output_odometry_topic_, 10);
+      node_.create_publisher<nav_msgs::msg::Odometry>(
+      output_odometry_topic_, rclcpp::QoS(output_qos_depth_));
+    current_pose_covariance_pub_ =
+      node_.create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      node_.get_name() + std::string("/current_pose_with_covariance"),
+      rclcpp::QoS(output_qos_depth_));
+    current_twist_pub_ = node_.create_publisher<geometry_msgs::msg::TwistStamped>(
+      node_.get_name() + std::string("/current_twist"), rclcpp::QoS(output_qos_depth_));
+    current_twist_covariance_pub_ =
+      node_.create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>(
+      node_.get_name() + std::string("/current_twist_with_covariance"),
+      rclcpp::QoS(output_qos_depth_));
     if (enable_fixed_lag_smoothing_) {
       const std::string smoothed_pose_name = node_.get_name() + std::string("/smoothed_pose");
       smoothed_pose_pub_ =
@@ -2110,122 +2221,22 @@ struct EkfLocalizationComponent::Impl
     }
 
     // Setup Subscriber
-    auto process_initial_pose =
-      [this](
-      const geometry_msgs::msg::PoseStamped::SharedPtr msg,
-      const bool use_message_covariance,
-      const std::array<double, 3> & position_variance,
-      const std::array<double, 3> & attitude_variance) -> void
-      {
-        RCLCPP_INFO(node_.get_logger(), "received initial pose");
-        initial_pose_received_ = true;
-        current_pose_ = *msg;
-
-        core::EKFEstimator::State state;
-        state.position = Eigen::Vector3d(
-          current_pose_.pose.position.x,
-          current_pose_.pose.position.y,
-          current_pose_.pose.position.z);
-        state.velocity = Eigen::Vector3d::Zero();
-        state.orientation = Eigen::Quaterniond(
-          current_pose_.pose.orientation.w,
-          current_pose_.pose.orientation.x,
-          current_pose_.pose.orientation.y,
-          current_pose_.pose.orientation.z);
-        ekf_.setState(state);
-        if (smoother_) {
-          smoother_ekf_.setState(state);
-          smoother_->reset();
-        }
-        const bool covariance_applied = use_message_covariance ?
-          applyInitialCovariance(
-          Eigen::Vector3d(
-            position_variance[0], position_variance[1], position_variance[2]),
-          Eigen::Vector3d(
-            attitude_variance[0], attitude_variance[1], attitude_variance[2])) :
-          applyConfiguredInitialCovariance();
-        if (!covariance_applied) {
-          RCLCPP_WARN(node_.get_logger(), "initial pose covariance was rejected; using EKF state");
-        }
-        stationary_initializer_.reset();
-        stationary_detector_.reset();
-        if (vehicle_model_) {
-          vehicle_model_->reset();
-        }
-        gnss_reacquisition_gate_.reset();
-        stationary_initialization_complete_ = !enable_stationary_initialization_;
-        yaw_initializer_.reset();
-        (void)yaw_initializer_.offer(
-          core::YawInitializer::Source::kExternalPose,
-          getYawRadFromQuaternion(state.orientation.normalized()),
-          std::max(
-            use_message_covariance ? attitude_variance[2] : initial_attitude_variance_yaw_,
-            1.0e-12),
-          stampToSec(msg->header.stamp));
-        if (std::isfinite(initial_dual_antenna_yaw_rad_)) {
-          (void)yaw_initializer_.offer(
-            core::YawInitializer::Source::kDualAntenna,
-            initial_dual_antenna_yaw_rad_, initial_dual_antenna_yaw_variance_,
-            stampToSec(msg->header.stamp));
-        }
-
-        // Reset IMU dt integration base on re-initialization.
-        has_previous_time_imu_ = false;
-        previous_time_imu_ = 0.0;
-        replay_->reset();
-        sensor_fault_monitor_.reset();
-
-        // Reset odom baseline too.
-        current_pose_odom_ = current_pose_;
-        has_previous_odom_ = false;
-        previous_odom_mat_ = Eigen::Matrix4d::Identity();
-
-        // Reset GNSS-derived baselines on re-initialization.
-        has_course_base_gnss_ = false;
-        has_previous_velocity_gnss_ = false;
-        has_latest_gnss_doppler_ = false;
-        has_latest_gnss_ = false;
-        latest_gnss_time_ = std::numeric_limits<double>::quiet_NaN();
-        has_reacquisition_previous_position_ = false;
-        has_stationary_start_time_ = false;
-      };
     auto initial_pose_callback =
-      [this, process_initial_pose](
-      const geometry_msgs::msg::PoseStamped::SharedPtr msg) -> void
-      {
+      [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
         ++received_initial_pose_count_;
-        enqueueInput(
-          msg->header.stamp, 0,
-          [process_initial_pose, msg]() {
-            process_initial_pose(msg, false, std::array<double, 3>{}, std::array<double, 3>{});
-          });
+        enqueueInput(msg->header.stamp, 0, [this, msg]() {handleInitialPose(*msg, nullptr);});
       };
     auto initial_pose_covariance_callback =
-      [this, process_initial_pose](
-      const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) -> void
-      {
+      [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
         ++received_initial_pose_count_;
-        enqueueInput(
-          msg->header.stamp, 0,
-          [this, process_initial_pose, msg]() {
-            auto pose = std::make_shared<geometry_msgs::msg::PoseStamped>();
-            pose->header = msg->header;
-            pose->pose = msg->pose.pose;
-            const std::array<double, 3> position_variance = {
-              positiveCovarianceOrFallback(
-                msg->pose.covariance[0], initial_position_variance_xy_),
-              positiveCovarianceOrFallback(
-                msg->pose.covariance[7], initial_position_variance_xy_),
-              positiveCovarianceOrFallback(
-                msg->pose.covariance[14], initial_position_variance_z_)};
-            const std::array<double, 3> attitude_variance = {
-              positiveCovarianceOrFallback(
-                msg->pose.covariance[21], initial_attitude_variance_rp_),
-              positiveCovarianceOrFallback(
-                msg->pose.covariance[28], initial_attitude_variance_rp_),
-              positiveCovarianceOrFallback(
-                msg->pose.covariance[35], initial_attitude_variance_yaw_)};
-            process_initial_pose(pose, true, position_variance, attitude_variance);
+        enqueueInput(msg->header.stamp, 0, [this, msg]() {
+            geometry_msgs::msg::PoseStamped pose;
+            pose.header = msg->header;
+            pose.pose = msg->pose.pose;
+            const Eigen::Matrix<double, 6, 6> covariance =
+            Eigen::Map<const Eigen::Matrix<double, 6, 6, Eigen::RowMajor>>(
+              msg->pose.covariance.data());
+            handleInitialPose(pose, &covariance);
           });
       };
 
@@ -2312,6 +2323,24 @@ struct EkfLocalizationComponent::Impl
           }
           last_imu_sensor_time_ = sensor_time;
           const bool prediction_ok = predictUpdate(transformed_msg);
+          commitPoseFreshness(prediction_ok);
+          if (prediction_ok) {
+            latest_body_gyro_ = Eigen::Vector3d(w_out.vector.x, w_out.vector.y, w_out.vector.z);
+            has_latest_body_gyro_ = true;
+            latest_body_gyro_covariance_ = 1.0e6 * Eigen::Matrix3d::Identity();
+            const Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>> noise(
+              msg->angular_velocity_covariance.data());
+            // All-zero covariance and first-entry -1 mean unknown in sensor_msgs/Imu.
+            if (noise.allFinite() && noise.isApprox(noise.transpose(), 1.0e-9) &&
+              noise.llt().info() == Eigen::Success)
+            {
+              const Eigen::Quaterniond robot_from_sensor(
+                transform.transform.rotation.w, transform.transform.rotation.x,
+                transform.transform.rotation.y, transform.transform.rotation.z);
+              const Eigen::Matrix3d rotation = robot_from_sensor.normalized().toRotationMatrix();
+              latest_body_gyro_covariance_ = rotation * noise * rotation.transpose();
+            }
+          }
           recordSensorOutcome(
             core::SensorFaultMonitor::Sensor::kImu, prediction_ok, sensor_time);
           const double callback_us = std::chrono::duration<double, std::micro>(
@@ -2671,6 +2700,24 @@ struct EkfLocalizationComponent::Impl
     imu_qos.keep_last(input_qos_depth_);
     sub_imu_ =
       node_.create_subscription<sensor_msgs::msg::Imu>(imu_topic_, imu_qos, imu_callback);
+    if (!pose_measurement_topic_.empty()) {
+      sub_pose_measurement_ =
+        node_.create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+        pose_measurement_topic_, rclcpp::QoS(input_qos_depth_),
+        [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+          ++received_pose_measurement_count_;
+          enqueueInput(msg->header.stamp, 30, [this, msg]() {handlePoseMeasurement(*msg);});
+        });
+    }
+    if (!twist_measurement_topic_.empty()) {
+      sub_twist_measurement_ =
+        node_.create_subscription<geometry_msgs::msg::TwistWithCovarianceStamped>(
+        twist_measurement_topic_, rclcpp::QoS(input_qos_depth_),
+        [this](const geometry_msgs::msg::TwistWithCovarianceStamped::SharedPtr msg) {
+          ++received_twist_measurement_count_;
+          enqueueInput(msg->header.stamp, 40, [this, msg]() {handleTwistMeasurement(*msg);});
+        });
+    }
     sub_odom_ =
       node_.create_subscription<nav_msgs::msg::Odometry>(
       odom_topic_, rclcpp::QoS(input_qos_depth_),
@@ -2725,11 +2772,42 @@ struct EkfLocalizationComponent::Impl
         std::string(" late=") + std::to_string(reorder_late_input_count_) +
         std::string(" buffered=") + std::to_string(input_reorder_queue_.size());
       });
+    reset_service_ = node_.create_service<std_srvs::srv::Trigger>(
+      node_.get_name() + std::string("/reset"),
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        resetSession();
+        response->success = true;
+        response->message = "reset complete; waiting for initial pose and IMU";
+        publishEstimatorStatus();
+      });
+    activation_service_ = node_.create_service<std_srvs::srv::SetBool>(
+      node_.get_name() + std::string("/trigger_node_srv"),
+      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+      std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+        if (!request->data) {
+          active_ = false;
+          resetSession();
+        } else {
+          // Sensors received while inactive never enter replay/reorder queues.
+          // Preserve a valid seed supplied before activation; repeated true is idempotent.
+          active_ = true;
+          awaiting_reset_seed_ = !initial_pose_received_;
+        }
+        response->success = true;
+        response->message = active_ ? "active; waiting for valid seed and IMU if needed" :
+        "inactive; cleared seed and sensor histories";
+        publishEstimatorStatus();
+      });
     if (output_publish_mode_ == "timer") {
       const std::chrono::milliseconds period(pub_period_);
       timer_ = node_.create_wall_timer(
         std::chrono::duration_cast<std::chrono::nanoseconds>(period),
         [this]() {broadcastPose();});
+    }
+    if (!pose_measurement_topic_.empty()) {
+      pose_status_timer_ = node_.create_wall_timer(
+        std::chrono::milliseconds(100), [this]() {publishEstimatorStatus();});
     }
   }
 
@@ -2888,6 +2966,7 @@ struct EkfLocalizationComponent::Impl
     const auto smoother_update = update;
     const auto status = replay_->applyMeasurement(
       sensor_time, arrival_time, measurement_id, std::move(update));
+    commitPoseFreshness(status == core::EskfReplay::Status::kApplied);
     feedSmootherMeasurement(sensor_time, measurement_id, status, smoother_update);
     if (debug_replay_timing_pub_) {
       const auto & trace = replay_->lastTimingTrace();
@@ -4564,9 +4643,428 @@ struct EkfLocalizationComponent::Impl
     }
   }
 
+  void resetSession()
+  {
+    initial_pose_received_ = false;
+    awaiting_reset_seed_ = true;
+    resetRuntimeTracking();
+    // A new clock epoch must not inherit newer dynamic lookup history.
+    // tf2 retains timeless static calibration while clearing dynamic caches.
+    tfbuffer_.clear();
+    input_reorder_queue_ = decltype(input_reorder_queue_){};
+    latest_buffered_stamp_nanoseconds_ = std::numeric_limits<std::int64_t>::min();
+    last_processed_stamp_nanoseconds_ = std::numeric_limits<std::int64_t>::min();
+    last_processed_priority_ = 0;
+    has_processed_buffered_input_ = false;
+    reorder_late_input_count_ = 0;
+    reorder_processed_input_count_ = 0;
+  }
+
+  void resetRuntimeTracking()
+  {
+    pending_tf_.clear();
+    has_received_input_ = false;
+    has_latest_imu_stamp_ = false;
+    has_latest_body_gyro_ = false;
+    latest_body_gyro_covariance_ = 1.0e6 * Eigen::Matrix3d::Identity();
+    has_accepted_pose_measurement_ = false;
+    latest_pose_measurement_time_ = std::numeric_limits<double>::quiet_NaN();
+    pose_freshness_candidate_ = std::numeric_limits<double>::quiet_NaN();
+    stationary_initializer_.reset();
+    stationary_detector_.reset();
+    if (vehicle_model_) {vehicle_model_->reset();}
+    gnss_reacquisition_gate_.reset();
+    stationary_initialization_complete_ = !enable_stationary_initialization_;
+    yaw_initializer_.reset();
+    has_previous_time_imu_ = false;
+    previous_time_imu_ = 0.0;
+    ekf_.resetImuTimeBase();
+    smoother_ekf_.resetImuTimeBase();
+    replay_->reset();
+    if (smoother_) {smoother_->reset();}
+    sensor_fault_monitor_.reset();
+    has_previous_odom_ = false;
+    previous_odom_mat_ = Eigen::Matrix4d::Identity();
+    has_course_base_gnss_ = false;
+    has_previous_velocity_gnss_ = false;
+    has_latest_gnss_doppler_ = false;
+    has_latest_gnss_ = false;
+    latest_gnss_time_ = std::numeric_limits<double>::quiet_NaN();
+    has_reacquisition_previous_position_ = false;
+    has_stationary_start_time_ = false;
+    gnss_position_reacquisition_updates_remaining_ = 0;
+    has_latest_wheel_speed_ = false;
+    wheel_scale_samples_.clear();
+    has_imu_wall_start_ = false;
+    has_imu_sensor_start_ = false;
+  }
+
+  void handleInitialPose(
+    geometry_msgs::msg::PoseStamped message,
+    const Eigen::Matrix<double, 6, 6> * incoming_covariance)
+  {
+    using Matrix6 = Eigen::Matrix<double, 6, 6>;
+    const auto reject = [this]() {
+        RCLCPP_WARN(node_.get_logger(), "reject invalid initial pose, frame or covariance");
+      };
+    core::EKFEstimator::Pose pose;
+    pose.position = Eigen::Vector3d(
+      message.pose.position.x, message.pose.position.y, message.pose.position.z);
+    pose.orientation = Eigen::Quaterniond(
+      message.pose.orientation.w, message.pose.orientation.x,
+      message.pose.orientation.y, message.pose.orientation.z);
+    if (message.header.frame_id.empty() || !pose.position.allFinite() ||
+      !pose.orientation.coeffs().allFinite() || !std::isfinite(pose.orientation.norm()) ||
+      !(pose.orientation.norm() > 1.0e-12))
+    {
+      reject(); return;
+    }
+    pose.orientation.normalize();
+    Matrix6 covariance = Matrix6::Zero();
+    covariance.diagonal() << initial_position_variance_xy_, initial_position_variance_xy_,
+      initial_position_variance_z_, initial_attitude_variance_rp_, initial_attitude_variance_rp_,
+      initial_attitude_variance_yaw_;
+    const bool full = incoming_covariance && initial_pose_covariance_mode_ == "full";
+    if (full) {
+      covariance = *incoming_covariance;
+    } else if (incoming_covariance) {
+      for (int axis = 0; axis < 6; ++axis) {
+        covariance(axis, axis) = positiveCovarianceOrFallback(
+          (*incoming_covariance)(axis, axis), covariance(axis, axis));
+      }
+    }
+    if (message.header.frame_id != reference_frame_id_) {
+      try {
+        const tf2::TimePoint time_point(
+          std::chrono::seconds(message.header.stamp.sec) +
+          std::chrono::nanoseconds(message.header.stamp.nanosec));
+        const auto transform = tf2::transformToEigen(tfbuffer_.lookupTransform(
+            reference_frame_id_, message.header.frame_id, time_point));
+        pose.position = transform * pose.position;
+        pose.orientation = Eigen::Quaterniond(transform.linear()) * pose.orientation;
+        if (incoming_covariance) {
+          Matrix6 rotation = Matrix6::Zero();
+          rotation.topLeftCorner<3, 3>() = transform.linear();
+          rotation.bottomRightCorner<3, 3>() = transform.linear();
+          covariance = rotation * covariance * rotation.transpose();
+        }
+      } catch (const tf2::TransformException & error) {
+        RCLCPP_WARN(node_.get_logger(), "reject initial pose without reference TF: %s",
+            error.what());
+        return;
+      }
+    }
+    auto candidate = ekf_;
+    auto smoother_candidate = smoother_ekf_;
+    const auto initialize = [this, &pose, &covariance, full](core::EKFEstimator & target) {
+        return core::initializePoseWithCovariance(
+          target, pose, covariance,
+          Eigen::Vector3d(initial_velocity_variance_xy_, initial_velocity_variance_xy_,
+          initial_velocity_variance_z_),
+          Eigen::Vector3d::Constant(initial_imu_gyro_bias_covariance_),
+          Eigen::Vector3d::Constant(initial_imu_acc_bias_covariance_), full);
+      };
+    if (!initialize(candidate) || (smoother_ && !initialize(smoother_candidate))) {
+      reject(); return;
+    }
+    // No state/latch/history is touched until the complete request is valid.
+    ekf_ = std::move(candidate);
+    if (smoother_) {smoother_ekf_ = std::move(smoother_candidate);}
+    resetRuntimeTracking();
+    initial_pose_received_ = true;
+    awaiting_reset_seed_ = false;
+    initialization_stamp_nanoseconds_ = stampToNanoseconds(message.header.stamp);
+    message.header.frame_id = reference_frame_id_;
+    message.pose.position.x = pose.position.x();
+    message.pose.position.y = pose.position.y();
+    message.pose.position.z = pose.position.z();
+    message.pose.orientation.x = pose.orientation.x();
+    message.pose.orientation.y = pose.orientation.y();
+    message.pose.orientation.z = pose.orientation.z();
+    message.pose.orientation.w = pose.orientation.w();
+    current_pose_ = message;
+    current_pose_odom_ = message;
+    (void)yaw_initializer_.offer(
+      core::YawInitializer::Source::kExternalPose, getYawRadFromQuaternion(pose.orientation),
+      std::max(covariance(5, 5), 1.0e-12), stampToSec(message.header.stamp));
+    if (std::isfinite(initial_dual_antenna_yaw_rad_)) {
+      (void)yaw_initializer_.offer(
+        core::YawInitializer::Source::kDualAntenna, initial_dual_antenna_yaw_rad_,
+        initial_dual_antenna_yaw_variance_, stampToSec(message.header.stamp));
+    }
+    RCLCPP_INFO(node_.get_logger(), "received initial pose");
+  }
+
+  void commitPoseFreshness(const bool succeeded)
+  {
+    if (succeeded && std::isfinite(pose_freshness_candidate_) &&
+      (!has_accepted_pose_measurement_ ||
+      pose_freshness_candidate_ > latest_pose_measurement_time_))
+    {
+      has_accepted_pose_measurement_ = true;
+      latest_pose_measurement_time_ = pose_freshness_candidate_;
+    }
+    pose_freshness_candidate_ = std::numeric_limits<double>::quiet_NaN();
+  }
+
+  void handlePoseMeasurement(const geometry_msgs::msg::PoseWithCovarianceStamped & message)
+  {
+    if (!initial_pose_received_) {
+      return;
+    }
+    using Matrix6 = Eigen::Matrix<double, 6, 6>;
+    Eigen::Vector3d position(
+      message.pose.pose.position.x, message.pose.pose.position.y, message.pose.pose.position.z);
+    Eigen::Quaterniond orientation(
+      message.pose.pose.orientation.w, message.pose.pose.orientation.x,
+      message.pose.pose.orientation.y, message.pose.pose.orientation.z);
+    Matrix6 covariance = Eigen::Map<const Eigen::Matrix<double, 6, 6, Eigen::RowMajor>>(
+      message.pose.covariance.data());
+    const auto reject = [this, &message]() {
+        const double unknown = std::numeric_limits<double>::quiet_NaN();
+        publishMeasurementQuality(
+          message.header.stamp, 8, false, core::MeasurementRejectReason::kInvalidInput,
+          unknown, unknown, unknown);
+      };
+    if (message.header.frame_id.empty() || !position.allFinite() ||
+      !orientation.coeffs().allFinite() || !std::isfinite(orientation.norm()) ||
+      !(orientation.norm() > 1.0e-12) ||
+      !covariance.allFinite() || !covariance.isApprox(covariance.transpose(), 1.0e-12) ||
+      covariance.llt().info() != Eigen::Success)
+    {
+      reject();
+      RCLCPP_WARN_THROTTLE(
+        node_.get_logger(), clock_, 5000, "reject invalid 6DoF pose or covariance");
+      return;
+    }
+    orientation.normalize();
+    if (message.header.frame_id != reference_frame_id_) {
+      try {
+        const tf2::TimePoint time_point(
+          std::chrono::seconds(message.header.stamp.sec) +
+          std::chrono::nanoseconds(message.header.stamp.nanosec));
+        const auto transform = tfbuffer_.lookupTransform(
+          reference_frame_id_, message.header.frame_id, time_point);
+        const Eigen::Isometry3d reference_from_source = tf2::transformToEigen(transform);
+        position = reference_from_source * position;
+        orientation = Eigen::Quaterniond(reference_from_source.linear()) * orientation;
+        Matrix6 rotation = Matrix6::Zero();
+        rotation.topLeftCorner<3, 3>() = reference_from_source.linear();
+        rotation.bottomRightCorner<3, 3>() = reference_from_source.linear();
+        covariance = rotation * covariance * rotation.transpose();
+      } catch (const tf2::TransformException & error) {
+        reject();
+        RCLCPP_WARN_THROTTLE(
+          node_.get_logger(), clock_, 5000, "reject 6DoF pose without reference TF: %s",
+          error.what());
+        return;
+      }
+    }
+    const auto reported = std::make_shared<bool>(false);
+    const auto update = [this, position, orientation, covariance, reported,
+        stamp = message.header.stamp](core::EKFEstimator & estimator) {
+        const auto diagnostics = estimator.observationUpdatePoseWithCovariance(
+          position, orientation, covariance, max_pose_nis_);
+        if (&estimator == &ekf_ && diagnostics.accepted) {
+          const double time = stampToSec(stamp);
+          pose_freshness_candidate_ = std::isfinite(pose_freshness_candidate_) ?
+            std::max(time, pose_freshness_candidate_) : time;
+        }
+        // Replay always re-evaluates the update. Report its first evaluation once,
+        // including a future-queued measurement when it is eventually applied.
+        if (&estimator == &ekf_ && !*reported) {
+          *reported = true;
+          const auto reason = diagnostics.accepted ? core::MeasurementRejectReason::kNone :
+            (diagnostics.reason == core::EKFEstimator::ObservationRejectReason::kNisGate ?
+            core::MeasurementRejectReason::kNis :
+            (diagnostics.status == core::EKFEstimator::ObservationUpdateStatus::kNumericalFailure ?
+            core::MeasurementRejectReason::kNumericalFailure :
+            core::MeasurementRejectReason::kInvalidInput));
+          publishMeasurementQuality(
+            stamp, 8, diagnostics.accepted, reason, diagnostics.innovation.head<3>().norm(),
+            diagnostics.nis, diagnostics.nis);
+        }
+        return diagnostics.status;
+      };
+    if (enable_measurement_replay_) {
+      (void)applyReplayMeasurement(message.header.stamp, 8U, update);
+    } else {
+      commitPoseFreshness(update(ekf_) == core::EKFEstimator::ObservationUpdateStatus::kUpdated);
+    }
+  }
+
+  void handleTwistMeasurement(const geometry_msgs::msg::TwistWithCovarianceStamped & message)
+  {
+    if (!initial_pose_received_) {
+      return;
+    }
+    const auto reject = [this, &message]() {
+        const double unknown = std::numeric_limits<double>::quiet_NaN();
+        publishMeasurementQuality(
+          message.header.stamp, 9, false, core::MeasurementRejectReason::kInvalidInput,
+          unknown, unknown, unknown);
+      };
+    Eigen::Matrix<double, 6, 1> raw;
+    raw << message.twist.twist.linear.x, message.twist.twist.linear.y,
+      message.twist.twist.linear.z, message.twist.twist.angular.x,
+      message.twist.twist.angular.y, message.twist.twist.angular.z;
+    if (message.header.frame_id.empty()) {reject(); return;}
+    Eigen::Isometry3d body_from_source = Eigen::Isometry3d::Identity();
+    if (message.header.frame_id != robot_frame_id_) {
+      try {
+        const tf2::TimePoint time_point(
+          std::chrono::seconds(message.header.stamp.sec) +
+          std::chrono::nanoseconds(message.header.stamp.nanosec));
+        body_from_source = tf2::transformToEigen(tfbuffer_.lookupTransform(
+            robot_frame_id_, message.header.frame_id, time_point));
+      } catch (const tf2::TransformException & error) {
+        reject();
+        RCLCPP_WARN_THROTTLE(
+          node_.get_logger(), clock_, 5000, "reject Twist without body TF: %s", error.what());
+        return;
+      }
+    }
+    // Keep measurements in SOURCE coordinates; only angular components that
+    // actually transport a selected linear component are required.
+    Eigen::Matrix<double, 3, 6> transport = Eigen::Matrix<double, 3, 6>::Zero();
+    transport.leftCols<3>().setIdentity();
+    if (body_from_source.translation().norm() > 1.0e-12) {
+      transport.rightCols<3>() = body_from_source.linear().transpose() *
+        core::EKFEstimator::skewSymmetric(body_from_source.translation()) *
+        body_from_source.linear();
+    }
+    std::vector<int> active;
+    for (int axis = 0; axis < 3; ++axis) {
+      if (twist_observed_axes_[axis]) {active.push_back(axis);}
+    }
+    for (int angular = 0; angular < 3; ++angular) {
+      bool needed = false;
+      for (int linear = 0; linear < 3; ++linear) {
+        needed = needed || (twist_observed_axes_[linear] &&
+          std::abs(transport(linear, angular + 3)) > 1.0e-12);
+      }
+      if (needed) {active.push_back(angular + 3);}
+    }
+    const Eigen::Map<const Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> source_covariance(
+      message.twist.covariance.data());
+    Eigen::MatrixXd selected_covariance(active.size(), active.size());
+    Eigen::Matrix<double, 6, 6> sanitized_covariance = Eigen::Matrix<double, 6, 6>::Zero();
+    Eigen::Matrix<double, 6, 1> sanitized = Eigen::Matrix<double, 6, 1>::Zero();
+    for (std::size_t row = 0; row < active.size(); ++row) {
+      if (!std::isfinite(raw(active[row]))) {reject(); return;}
+      sanitized(active[row]) = raw(active[row]);
+      for (std::size_t col = 0; col < active.size(); ++col) {
+        selected_covariance(row, col) = source_covariance(active[row], active[col]);
+        sanitized_covariance(active[row], active[col]) = selected_covariance(row, col);
+      }
+    }
+    if (!selected_covariance.allFinite() ||
+      !selected_covariance.isApprox(selected_covariance.transpose(), 1.0e-12) ||
+      selected_covariance.llt().info() != Eigen::Success)
+    {
+      reject();
+      return;
+    }
+    const Eigen::Vector3d velocity = transport * sanitized;
+    const Eigen::Matrix3d covariance = transport * sanitized_covariance * transport.transpose();
+    const Eigen::Matrix3d source_from_body = body_from_source.linear().transpose();
+    const auto reported = std::make_shared<bool>(false);
+    const auto update = [this, velocity, covariance, source_from_body, reported,
+        stamp = message.header.stamp](core::EKFEstimator & estimator) {
+        const auto diagnostics = estimator.observationUpdateSelectedBodyVelocity(
+          velocity, covariance, source_from_body, twist_observed_axes_, max_twist_nis_);
+        if (&estimator == &ekf_ && !*reported) {
+          *reported = true;
+          const auto reason = diagnostics.accepted ? core::MeasurementRejectReason::kNone :
+            (diagnostics.reason == core::EKFEstimator::ObservationRejectReason::kNisGate ?
+            core::MeasurementRejectReason::kNis :
+            (diagnostics.status == core::EKFEstimator::ObservationUpdateStatus::kNumericalFailure ?
+            core::MeasurementRejectReason::kNumericalFailure :
+            core::MeasurementRejectReason::kInvalidInput));
+          publishMeasurementQuality(
+            stamp, 9, diagnostics.accepted, reason, diagnostics.innovation_norm,
+            diagnostics.nis, diagnostics.nis);
+        }
+        return diagnostics.status;
+      };
+    if (enable_measurement_replay_) {
+      (void)applyReplayMeasurement(message.header.stamp, 9U, update);
+    } else {
+      (void)update(ekf_);
+    }
+  }
+
+  void broadcastReferenceTransform()
+  {
+    if (!tf_broadcaster_) {
+      return;
+    }
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header = current_pose_.header;
+    transform.child_frame_id = robot_frame_id_;
+    transform.transform.translation.x = current_pose_.pose.position.x;
+    transform.transform.translation.y = current_pose_.pose.position.y;
+    transform.transform.translation.z = current_pose_.pose.position.z;
+    transform.transform.rotation = current_pose_.pose.orientation;
+    if (tf_output_mode_ == "reference_to_base") {
+      tf_broadcaster_->sendTransform(transform);
+      return;
+    }
+
+    // Keep global poses until local odometry TF reaches the SAME sensor stamp.
+    // Composing a current global pose with an older "latest" local pose gives
+    // a false map->odom motion. Do not mix those timestamps or block the IMU.
+    if (pending_tf_.empty() ||
+      rclcpp::Time(current_pose_.header.stamp) > rclcpp::Time(pending_tf_.back().header.stamp))
+    {
+      pending_tf_.push_back(current_pose_);
+    }
+    if (pending_tf_.size() > 200U) {
+      pending_tf_.pop_front();
+      RCLCPP_WARN_THROTTLE(
+        node_.get_logger(), clock_, 5000, "dropping global TF pose: local odometry TF is behind");
+    }
+    try {
+      const auto latest = tfbuffer_.lookupTransform(
+        odom_frame_id_, robot_frame_id_, tf2::TimePointZero);
+      const bool timeless = latest.header.stamp.sec == 0 && latest.header.stamp.nanosec == 0;
+      for (auto it = pending_tf_.rbegin(); it != pending_tf_.rend(); ++it) {
+        if (!timeless && rclcpp::Time(it->header.stamp) > rclcpp::Time(latest.header.stamp)) {
+          continue;
+        }
+        const tf2::TimePoint time_point(
+          std::chrono::seconds(it->header.stamp.sec) +
+          std::chrono::nanoseconds(it->header.stamp.nanosec));
+        const auto local = tfbuffer_.lookupTransform(odom_frame_id_, robot_frame_id_, time_point);
+        Eigen::Isometry3d reference_from_body = Eigen::Isometry3d::Identity();
+        reference_from_body.translation() = Eigen::Vector3d(
+          it->pose.position.x, it->pose.position.y, it->pose.position.z);
+        reference_from_body.linear() = Eigen::Quaterniond(
+          it->pose.orientation.w, it->pose.orientation.x,
+          it->pose.orientation.y, it->pose.orientation.z).normalized().toRotationMatrix();
+        transform = tf2::eigenToTransform(core::referenceToOdometry(
+            reference_from_body, tf2::transformToEigen(local)));
+        transform.header = it->header;
+        transform.child_frame_id = odom_frame_id_;
+        tf_broadcaster_->sendTransform(transform);
+        const auto published_stamp = rclcpp::Time(it->header.stamp);
+        while (!pending_tf_.empty() &&
+          rclcpp::Time(pending_tf_.front().header.stamp) <= published_stamp)
+        {
+          pending_tf_.pop_front();
+        }
+        return;
+      }
+    } catch (const tf2::TransformException & error) {
+      RCLCPP_WARN_THROTTLE(
+        node_.get_logger(), clock_, 5000, "waiting for timestamp-aligned odometry TF: %s",
+        error.what());
+    }
+  }
+
   void broadcastPose()
   {
-    if (!initial_pose_received_ || !has_received_input_) {
+    if (!active_ || !initial_pose_received_ || !has_received_input_ || !has_latest_imu_stamp_) {
       publishEstimatorStatus();
       return;
     }
@@ -4596,43 +5094,45 @@ struct EkfLocalizationComponent::Impl
       publishSmoothedPose();
     }
     const auto state = ekf_.getState();
-    const Eigen::MatrixXd covariance = ekf_.getCovariance();
+    const core::EKFEstimator::ErrorStateMatrix covariance = ekf_.getCovariance();
     nav_msgs::msg::Odometry odometry_msg;
     odometry_msg.header = current_pose_.header;
     odometry_msg.child_frame_id = robot_frame_id_;
     odometry_msg.pose.pose = current_pose_.pose;
-    for (int row = 0; row < 3; ++row) {
-      for (int col = 0; col < 3; ++col) {
-        odometry_msg.pose.covariance[row * 6 + col] = covariance(row, col);
-        odometry_msg.pose.covariance[(row + 3) * 6 + col + 3] =
-          covariance(row + 6, col + 6);
-      }
-    }
+    const core::OutputCovariance pose_covariance = core::poseOutputCovariance(state, covariance);
     const Eigen::Matrix3d world_from_body = state.orientation.normalized().toRotationMatrix();
     const Eigen::Vector3d body_velocity = world_from_body.transpose() * state.velocity;
-    const Eigen::Matrix3d body_velocity_covariance =
-      world_from_body.transpose() * covariance.block<3, 3>(3, 3) * world_from_body;
+    const core::OutputCovariance twist_covariance = core::bodyTwistOutputCovariance(
+      state, covariance, latest_body_gyro_covariance_);
     odometry_msg.twist.twist.linear.x = body_velocity.x();
     odometry_msg.twist.twist.linear.y = body_velocity.y();
     odometry_msg.twist.twist.linear.z = body_velocity.z();
-    for (int row = 0; row < 3; ++row) {
-      for (int col = 0; col < 3; ++col) {
-        odometry_msg.twist.covariance[row * 6 + col] = body_velocity_covariance(row, col);
+    const Eigen::Vector3d angular_velocity = has_latest_body_gyro_ ?
+      Eigen::Vector3d(latest_body_gyro_ - state.gyro_bias) : Eigen::Vector3d::Zero();
+    odometry_msg.twist.twist.angular.x = angular_velocity.x();
+    odometry_msg.twist.twist.angular.y = angular_velocity.y();
+    odometry_msg.twist.twist.angular.z = angular_velocity.z();
+    for (int row = 0; row < 6; ++row) {
+      for (int col = 0; col < 6; ++col) {
+        odometry_msg.pose.covariance[row * 6 + col] = pose_covariance(row, col);
+        odometry_msg.twist.covariance[row * 6 + col] = twist_covariance(row, col);
       }
-      odometry_msg.twist.covariance[(row + 3) * 6 + row + 3] = 1.0e6;
     }
     current_odometry_pub_->publish(odometry_msg);
-
-    if (tf_broadcaster_) {
-      geometry_msgs::msg::TransformStamped transform;
-      transform.header = current_pose_.header;
-      transform.child_frame_id = robot_frame_id_;
-      transform.transform.translation.x = current_pose_.pose.position.x;
-      transform.transform.translation.y = current_pose_.pose.position.y;
-      transform.transform.translation.z = current_pose_.pose.position.z;
-      transform.transform.rotation = current_pose_.pose.orientation;
-      tf_broadcaster_->sendTransform(transform);
-    }
+    geometry_msgs::msg::PoseWithCovarianceStamped pose_with_covariance;
+    pose_with_covariance.header = odometry_msg.header;
+    pose_with_covariance.pose = odometry_msg.pose;
+    current_pose_covariance_pub_->publish(pose_with_covariance);
+    geometry_msgs::msg::TwistWithCovarianceStamped twist_with_covariance;
+    twist_with_covariance.header = odometry_msg.header;
+    twist_with_covariance.header.frame_id = robot_frame_id_;
+    twist_with_covariance.twist = odometry_msg.twist;
+    current_twist_covariance_pub_->publish(twist_with_covariance);
+    geometry_msgs::msg::TwistStamped twist;
+    twist.header = twist_with_covariance.header;
+    twist.twist = twist_with_covariance.twist.twist;
+    current_twist_pub_->publish(twist);
+    broadcastReferenceTransform();
 
     geometry_msgs::msg::Vector3Stamped gyro_bias_msg;
     gyro_bias_msg.header = current_pose_.header;
@@ -4658,6 +5158,19 @@ struct EkfLocalizationComponent::Impl
   std::string robot_frame_id_;
   std::string initial_pose_topic_;
   std::string initial_pose_covariance_topic_;
+  std::string initial_pose_covariance_mode_;
+  bool active_{true};
+  bool awaiting_reset_seed_{false};
+  std::int64_t initialization_stamp_nanoseconds_{std::numeric_limits<std::int64_t>::min()};
+  std::string pose_measurement_topic_;
+  std::string twist_measurement_topic_;
+  std::array<bool, 3> twist_observed_axes_{{true, true, true}};
+  double max_twist_nis_{0.0};
+  double pose_measurement_timeout_sec_{1.0};
+  bool has_accepted_pose_measurement_{false};
+  double latest_pose_measurement_time_{std::numeric_limits<double>::quiet_NaN()};
+  double pose_freshness_candidate_{std::numeric_limits<double>::quiet_NaN()};
+  double max_pose_nis_{0.0};
   std::string imu_topic_;
   std::string odom_topic_;
   std::string odom_input_mode_;
@@ -4837,6 +5350,12 @@ struct EkfLocalizationComponent::Impl
   std::string output_publish_mode_{"timer"};
   std::string output_odometry_topic_;
   bool publish_tf_{false};
+  std::string tf_output_mode_;
+  std::string odom_frame_id_;
+  std::deque<geometry_msgs::msg::PoseStamped> pending_tf_;
+  bool has_latest_body_gyro_{false};
+  Eigen::Vector3d latest_body_gyro_{Eigen::Vector3d::Zero()};
+  Eigen::Matrix3d latest_body_gyro_covariance_{1.0e6 * Eigen::Matrix3d::Identity()};
 
   bool initial_pose_received_{false};
   bool has_received_input_{false};
@@ -4845,6 +5364,8 @@ struct EkfLocalizationComponent::Impl
   double latest_gnss_time_{std::numeric_limits<double>::quiet_NaN()};
 
   std::uint64_t received_initial_pose_count_{0};
+  std::uint64_t received_pose_measurement_count_{0};
+  std::uint64_t received_twist_measurement_count_{0};
   std::uint64_t received_imu_count_{0};
   std::uint64_t received_odom_count_{0};
   std::uint64_t received_gnss_pose_count_{0};
@@ -4925,13 +5446,24 @@ struct EkfLocalizationComponent::Impl
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_gnss_pose_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+    sub_pose_measurement_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr
+    sub_twist_measurement_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr sub_gnss_navsatfix_;
   rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr
     sub_gnss_doppler_velocity_;
   rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr
     sub_wheel_speed_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr drain_input_buffer_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr activation_service_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr current_pose_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+    current_pose_covariance_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr current_twist_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr
+    current_twist_covariance_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr smoothed_pose_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr current_odometry_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr current_gyro_bias_pub_;
@@ -4954,6 +5486,7 @@ struct EkfLocalizationComponent::Impl
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
     debug_measurement_quality_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr pose_status_timer_;
   rclcpp::Clock clock_;
   tf2_ros::Buffer tfbuffer_;
   tf2_ros::TransformListener listener_;

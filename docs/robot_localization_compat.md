@@ -25,10 +25,15 @@ In absolute mode, the x/y/z block of `Odometry.pose.covariance` is used when it
 is finite and positive-definite. `var_odom_xyz` is the fallback for missing,
 zero, or invalid covariance.
 
-The covariance-bearing initial pose uses the diagonal entries for x/y/z and
+By default, the covariance-bearing initial pose uses the diagonal entries for x/y/z and
 roll/pitch/yaw. Non-positive or non-finite entries fall back independently to
 `initial_position_variance_*` and `initial_attitude_variance_*`. The existing
 `PoseStamped` initial-pose subscription remains available for legacy users.
+
+Select `initial_pose_covariance_mode: full` to preserve a valid correlated 6×6
+initial covariance. Initial poses are transformed to `reference_frame_id` at
+their timestamps; invalid full covariance or missing TF rejects the request
+without resetting a running estimator. See [initialization/reset](initialization_reset.md).
 
 The odometry pose must already be expressed in `reference_frame_id`; kf_ws does
 not silently reinterpret a robot_localization frame ID. Verify the upstream TF

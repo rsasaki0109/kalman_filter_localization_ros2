@@ -39,6 +39,7 @@
 #include <unsupported/Eigen/MatrixFunctions>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cmath>
 #include <limits>
@@ -96,16 +97,28 @@ public:
     kNumericalInvariant,
   };
 
-  struct ObservationUpdateDiagnostics3
+  template<int MeasurementSize>
+  struct ObservationUpdateDiagnostics
   {
     ObservationUpdateStatus status{ObservationUpdateStatus::kInvalidMeasurement};
     ObservationRejectReason reason{ObservationRejectReason::kInvalidMeasurement};
-    Eigen::Vector3d innovation{Eigen::Vector3d::Constant(
+    Eigen::Matrix<double, MeasurementSize, 1> innovation{
+      Eigen::Matrix<double, MeasurementSize, 1>::Constant(
         std::numeric_limits<double>::quiet_NaN())};
-    Eigen::Matrix3d innovation_covariance{Eigen::Matrix3d::Constant(
+    Eigen::Matrix<double, MeasurementSize, MeasurementSize> innovation_covariance{
+      Eigen::Matrix<double, MeasurementSize, MeasurementSize>::Constant(
         std::numeric_limits<double>::quiet_NaN())};
     double nis{std::numeric_limits<double>::quiet_NaN()};
     bool accepted{false};
+  };
+
+  using ObservationUpdateDiagnostics3 = ObservationUpdateDiagnostics<3>;
+  using ObservationUpdateDiagnostics6 = ObservationUpdateDiagnostics<6>;
+
+  struct SelectedVelocityDiagnostics : ObservationUpdateDiagnostics3
+  {
+    int dimensions{0};
+    double innovation_norm{std::numeric_limits<double>::quiet_NaN()};
   };
 
   struct ObservationUpdateDiagnostics1
@@ -633,6 +646,7 @@ public:
     previous_time_imu_ = 0.0;
     has_previous_time_imu_ = false;
     has_previous_imu_measurement_ = false;
+    has_last_discrete_model_ = false;
   }
 
   bool primeImuMeasurement(
@@ -728,8 +742,49 @@ public:
   {
     ObservationJacobian3 jacobian;
     const Eigen::Vector3d predicted = positionObservation(getState(), &jacobian);
-    return performObservationUpdate3(
+    return performObservationUpdate<3>(
       measured_position, predicted, jacobian, measurement_covariance, max_nis);
+  }
+
+  // Joint 6DoF body pose. Input covariance is [position, fixed-world-axis rotation]
+  // in the world frame (ROS convention), not Euler-angle covariance. Convert the
+  // FULL matrix to the current right-error tangent, preserving cross covariance.
+  // As with the orientation update, the measurement model is locally linearized.
+  ObservationUpdateDiagnostics6 observationUpdatePoseWithCovariance(
+    const Eigen::Vector3d & measured_position,
+    const Eigen::Quaterniond & measured_orientation,
+    const Eigen::Matrix<double, 6, 6> & world_pose_covariance,
+    const double max_nis = 0.0)
+  {
+    const double orientation_norm = measured_orientation.norm();
+    if (!measured_position.allFinite() || !measured_orientation.coeffs().allFinite() ||
+      !std::isfinite(orientation_norm) || !(orientation_norm > 1.0e-12) ||
+      !std::isfinite(max_nis) || max_nis < 0.0)
+    {
+      return ObservationUpdateDiagnostics6{};
+    }
+    const State state = getState();
+    const Eigen::Quaterniond orientation = state.orientation.normalized();
+    Eigen::Quaterniond difference = orientation.conjugate() * measured_orientation.normalized();
+    if (difference.w() < 0.0) {
+      difference.coeffs() *= -1.0;
+    }
+    const Eigen::AngleAxisd rotation(difference.normalized());
+    Eigen::Matrix<double, 6, 1> measurement;
+    measurement.head<3>() = measured_position;
+    measurement.tail<3>() = rotation.axis() * rotation.angle();
+    Eigen::Matrix<double, 6, 1> predicted = Eigen::Matrix<double, 6, 1>::Zero();
+    predicted.head<3>() = state.position;
+    Eigen::Matrix<double, 6, kErrorStateSize> jacobian =
+      Eigen::Matrix<double, 6, kErrorStateSize>::Zero();
+    jacobian.block<3, 3>(0, 0).setIdentity();
+    jacobian.block<3, 3>(3, 6).setIdentity();
+    Eigen::Matrix<double, 6, 6> to_tangent = Eigen::Matrix<double, 6, 6>::Identity();
+    to_tangent.bottomRightCorner<3, 3>() = orientation.toRotationMatrix().transpose();
+    const Eigen::Matrix<double, 6, 6> measurement_covariance =
+      to_tangent * world_pose_covariance * to_tangent.transpose();
+    return performObservationUpdate<6>(
+      measurement, predicted, jacobian, measurement_covariance, max_nis);
   }
 
   ObservationUpdateDiagnostics3 observationUpdateLeverArmPositionWithCovariance(
@@ -744,7 +799,7 @@ public:
     ObservationJacobian3 jacobian;
     const Eigen::Vector3d predicted = leverArmPositionObservation(
       getState(), antenna_lever_arm_body, &jacobian);
-    return performObservationUpdate3(
+    return performObservationUpdate<3>(
       measured_antenna_position, predicted, jacobian, measurement_covariance, max_nis);
   }
 
@@ -755,8 +810,52 @@ public:
   {
     ObservationJacobian3 jacobian;
     const Eigen::Vector3d predicted = worldVelocityObservation(getState(), &jacobian);
-    return performObservationUpdate3(
+    return performObservationUpdate<3>(
       measured_velocity, predicted, jacobian, measurement_covariance, max_nis);
+  }
+
+  ObservationUpdateDiagnostics3 observationUpdateBodyVelocityWithCovariance(
+    const Eigen::Vector3d & measured_velocity,
+    const Eigen::Matrix3d & measurement_covariance,
+    const double max_nis = 0.0)
+  {
+    ObservationJacobian3 jacobian;
+    const Eigen::Vector3d predicted = bodyVelocityObservation(getState(), &jacobian);
+    return performObservationUpdate<3>(
+      measured_velocity, predicted, jacobian, measurement_covariance, max_nis);
+  }
+
+  SelectedVelocityDiagnostics observationUpdateSelectedBodyVelocity(
+    const Eigen::Vector3d & measured_velocity,
+    const Eigen::Matrix3d & measurement_covariance,
+    const Eigen::Matrix3d & measurement_from_body,
+    const std::array<bool, 3> & observed_axes,
+    const double max_nis = 0.0)
+  {
+    if (!measurement_from_body.allFinite() || !std::isfinite(max_nis) || max_nis < 0.0 ||
+      !(measurement_from_body * measurement_from_body.transpose()).isApprox(
+        Eigen::Matrix3d::Identity(), 1.0e-9) ||
+      std::abs(measurement_from_body.determinant() - 1.0) > 1.0e-9)
+    {
+      return SelectedVelocityDiagnostics{};
+    }
+    ObservationJacobian3 body_jacobian;
+    const Eigen::Vector3d body_velocity = bodyVelocityObservation(getState(), &body_jacobian);
+    const Eigen::Vector3d predicted = measurement_from_body * body_velocity;
+    const ObservationJacobian3 jacobian = measurement_from_body * body_jacobian;
+    switch (std::count(observed_axes.begin(), observed_axes.end(), true)) {
+      case 1:
+        return performSelectedVelocityUpdate<1>(
+          measured_velocity, predicted, jacobian, measurement_covariance, observed_axes, max_nis);
+      case 2:
+        return performSelectedVelocityUpdate<2>(
+          measured_velocity, predicted, jacobian, measurement_covariance, observed_axes, max_nis);
+      case 3:
+        return performSelectedVelocityUpdate<3>(
+          measured_velocity, predicted, jacobian, measurement_covariance, observed_axes, max_nis);
+      default:
+        return SelectedVelocityDiagnostics{};
+    }
   }
 
   ObservationUpdateDiagnostics1 observationUpdateYawWithVariance(
@@ -1476,14 +1575,56 @@ private:
     DBAX = 12, DBAY = 13, DBAZ = 14,
   };
 
-  ObservationUpdateDiagnostics3 performObservationUpdate3(
-    const Eigen::Vector3d & measured,
-    const Eigen::Vector3d & predicted,
-    const ObservationJacobian3 & jacobian,
-    const Eigen::Matrix3d & measurement_covariance,
+  template<int MeasurementSize>
+  SelectedVelocityDiagnostics performSelectedVelocityUpdate(
+    const Eigen::Vector3d & measured, const Eigen::Vector3d & predicted,
+    const ObservationJacobian3 & jacobian, const Eigen::Matrix3d & covariance,
+    const std::array<bool, 3> & axes, const double max_nis)
+  {
+    std::array<int, MeasurementSize> indices{};
+    int row = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+      if (axes[axis]) {indices[row++] = axis;}
+    }
+    Eigen::Matrix<double, MeasurementSize, 1> selected_measured;
+    Eigen::Matrix<double, MeasurementSize, 1> selected_predicted;
+    Eigen::Matrix<double, MeasurementSize, MeasurementSize> selected_covariance;
+    Eigen::Matrix<double, MeasurementSize, num_error_state_> selected_jacobian;
+    for (int i = 0; i < MeasurementSize; ++i) {
+      selected_measured(i) = measured(indices[i]);
+      selected_predicted(i) = predicted(indices[i]);
+      selected_jacobian.row(i) = jacobian.row(indices[i]);
+      for (int j = 0; j < MeasurementSize; ++j) {
+        selected_covariance(i, j) = covariance(indices[i], indices[j]);
+      }
+    }
+    const auto selected = performObservationUpdate<MeasurementSize>(
+      selected_measured, selected_predicted, selected_jacobian, selected_covariance, max_nis);
+    SelectedVelocityDiagnostics result;
+    result.status = selected.status;
+    result.reason = selected.reason;
+    result.accepted = selected.accepted;
+    result.nis = selected.nis;
+    result.dimensions = MeasurementSize;
+    result.innovation_norm = selected.innovation.norm();
+    for (int i = 0; i < MeasurementSize; ++i) {
+      result.innovation(indices[i]) = selected.innovation(i);
+      for (int j = 0; j < MeasurementSize; ++j) {
+        result.innovation_covariance(indices[i], indices[j]) = selected.innovation_covariance(i, j);
+      }
+    }
+    return result;
+  }
+
+  template<int MeasurementSize>
+  ObservationUpdateDiagnostics<MeasurementSize> performObservationUpdate(
+    const Eigen::Matrix<double, MeasurementSize, 1> & measured,
+    const Eigen::Matrix<double, MeasurementSize, 1> & predicted,
+    const Eigen::Matrix<double, MeasurementSize, num_error_state_> & jacobian,
+    const Eigen::Matrix<double, MeasurementSize, MeasurementSize> & measurement_covariance,
     const double max_nis)
   {
-    ObservationUpdateDiagnostics3 diagnostics;
+    ObservationUpdateDiagnostics<MeasurementSize> diagnostics;
     if (!measured.allFinite() || !predicted.allFinite() || !jacobian.allFinite() ||
       !std::isfinite(max_nis))
     {
@@ -1498,7 +1639,8 @@ private:
       diagnostics.reason = ObservationRejectReason::kInvalidCovariance;
       return diagnostics;
     }
-    const Eigen::LDLT<Eigen::Matrix3d> covariance_decomposition(measurement_covariance);
+    const Eigen::LDLT<Eigen::Matrix<double, MeasurementSize,
+      MeasurementSize>> covariance_decomposition(measurement_covariance);
     if (covariance_decomposition.info() != Eigen::Success ||
       !covariance_decomposition.isPositive())
     {
@@ -1506,7 +1648,7 @@ private:
       diagnostics.reason = ObservationRejectReason::kInvalidCovariance;
       return diagnostics;
     }
-    const Eigen::Vector3d covariance_pivots =
+    const Eigen::Matrix<double, MeasurementSize, 1> covariance_pivots =
       covariance_decomposition.vectorD().cwiseAbs();
     if (!(covariance_pivots.minCoeff() > 1.0e-12 * covariance_pivots.maxCoeff())) {
       diagnostics.status = ObservationUpdateStatus::kInvalidVariance;
@@ -1518,7 +1660,8 @@ private:
       jacobian * P_ * jacobian.transpose() + measurement_covariance;
     diagnostics.innovation_covariance = 0.5 *
       (diagnostics.innovation_covariance + diagnostics.innovation_covariance.transpose());
-    const Eigen::LDLT<Eigen::Matrix3d> innovation_decomposition(
+    const Eigen::LDLT<Eigen::Matrix<double, MeasurementSize,
+      MeasurementSize>> innovation_decomposition(
       diagnostics.innovation_covariance);
     if (innovation_decomposition.info() != Eigen::Success ||
       !innovation_decomposition.isPositive())
@@ -1527,14 +1670,15 @@ private:
       diagnostics.reason = ObservationRejectReason::kInnovationNotPositiveDefinite;
       return diagnostics;
     }
-    const Eigen::Vector3d absolute_pivots = innovation_decomposition.vectorD().cwiseAbs();
+    const Eigen::Matrix<double, MeasurementSize,
+      1> absolute_pivots = innovation_decomposition.vectorD().cwiseAbs();
     if (!(absolute_pivots.minCoeff() > 1.0e-12 * absolute_pivots.maxCoeff())) {
       diagnostics.status = ObservationUpdateStatus::kNumericalFailure;
       diagnostics.reason = ObservationRejectReason::kInnovationNotPositiveDefinite;
       return diagnostics;
     }
 
-    const Eigen::Vector3d whitened_innovation =
+    const Eigen::Matrix<double, MeasurementSize, 1> whitened_innovation =
       innovation_decomposition.solve(diagnostics.innovation);
     diagnostics.nis = diagnostics.innovation.dot(whitened_innovation);
     if (innovation_decomposition.info() != Eigen::Success ||
@@ -1552,9 +1696,9 @@ private:
       return diagnostics;
     }
 
-    const Eigen::Matrix<double, num_error_state_, 3> covariance_times_jacobian =
+    const Eigen::Matrix<double, num_error_state_, MeasurementSize> covariance_times_jacobian =
       P_ * jacobian.transpose();
-    const Eigen::Matrix<double, num_error_state_, 3> gain =
+    const Eigen::Matrix<double, num_error_state_, MeasurementSize> gain =
       innovation_decomposition.solve(covariance_times_jacobian.transpose()).transpose();
     if (innovation_decomposition.info() != Eigen::Success || !gain.allFinite()) {
       diagnostics.status = ObservationUpdateStatus::kNumericalFailure;

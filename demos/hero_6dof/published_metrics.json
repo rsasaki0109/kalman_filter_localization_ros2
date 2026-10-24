@@ -1,0 +1,46 @@
+{
+  "kind": "Synthetic illustration; not a real-data benchmark",
+  "position_3d_rmse_m": 0.5416086836774188,
+  "max_position_3d_error_m": 2.2545282128882023,
+  "outage_max_position_3d_error_m": 2.2545282128882023,
+  "max_attitude_geodesic_error_deg": 0.6290191672080435,
+  "attitude_geodesic_rmse_deg": 0.22638546775865132,
+  "height_span_m": 15.588453735842773,
+  "max_abs_roll_deg": 15.883619995672788,
+  "max_abs_pitch_deg": 14.931417178137554,
+  "output_samples": 4801,
+  "rewind_count": 1142,
+  "source_sha256": {
+    "reference.csv": "0e1473ce31603810e5730a1e9fd9de94630a25ea9b3d393a1f48f26433dc82cc",
+    "estimate.csv": "34ff35174294fac2d78cb0b58eedc33c9c5fa05fff8d612b0810b23cb0b7e7b7",
+    "observations.csv": "193e92e1cd2fdf5704ad0bbfa5948f4057065d7ec1d6c2d6c7dc3e95ffd06dc5",
+    "scenario.json": "034f272a6f42401d41a4c46175646e37441897fe97421f08c41e2b9578aacbeb"
+  },
+  "render_source_sha256": "079b429b2d8d11ec550b82ee98b311827a1fcf6504d741308e223a650d226fc3",
+  "published_date": "2026-10-24",
+  "scenario_duration_sec": 48.0,
+  "absolute_pose_outage_sec": [
+    18.0,
+    30.0
+  ],
+  "pose_delay_sec": 0.15,
+  "received_imu": 4801,
+  "received_pose": 181,
+  "received_twist": 961,
+  "numerical_failures": 0,
+  "artifact_sha256": {
+    "hero.gif": "756ec94eb89fadd01fa30583121e4c9455cff459edd9a9bc40b6580394f0a75a",
+    "hero.mp4": "1c62454d75f720549c0c20130bcb3c97f08b1ebdef864b521e4edd5e45cc7371"
+  },
+  "animation": {
+    "width": 1120,
+    "height": 700,
+    "fps": 20,
+    "duration_sec": 14
+  },
+  "limits": {
+    "position_3d_rmse_m": 1.0,
+    "max_position_3d_error_m": 3.0,
+    "max_attitude_geodesic_error_deg": 2.0
+  }
+}

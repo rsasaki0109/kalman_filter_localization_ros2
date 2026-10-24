@@ -37,6 +37,16 @@ standard-deviation summaries, wheel scale, input counters, measurement accept /
 reject counters, replay rewinds, and reorder-buffer counters. A consumer should
 use `health` for the coarse decision and `mode`/`summary` for the reason.
 
+Status and diagnostic headers use the current ROS assessment time; `filter_time`
+and `latest_imu_time` preserve the estimator/sample timeline. When a full-pose
+input is enabled, a 100 ms wall timer continues status publication without IMU
+callbacks. `pose_input_enabled`, `pose_available`, `pose_age_sec` and
+`received_pose_measurements` expose the ROS-clock-based watchdog; stale poses
+degrade health even when stationary. Invalid/duplicate inputs do not refresh
+availability. See [pose measurements](pose_measurements.md) for timeout and
+clock/reset semantics. `received_twist_measurements` counts the optional Twist
+input callbacks. These added fields require rebuilding custom-message clients.
+
 When `enable_sensor_fault_isolation` is enabled, the status additionally reports
 per-sensor isolation flags and fault-event counters for IMU, GNSS, wheel, and
 odometry. A sensor is isolated after `sensor_fault_trip_count` consecutive bad
@@ -91,3 +101,8 @@ Set `vehicle_model_plugin` to the exported plugin class name. A plugin receives
 timestamped body velocity, yaw rate, lateral acceleration, and optional wheel
 innovation, and returns a bounded NHC policy. It must reject invalid
 configuration or non-finite input rather than silently applying a constraint.
+
+`EstimatorStatus.active` reports the activation gate. An inactive node reports
+`initialized=false`, `summary=inactive` and suppresses sensor processing and
+state/TF output. Status/diagnostics continue through their configured timers.
+See [stack launch/activation](stack_launch.md).

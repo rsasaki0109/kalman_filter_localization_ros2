@@ -62,3 +62,13 @@ uint64 imu_fault_events
 uint64 gnss_fault_events
 uint64 wheel_fault_events
 uint64 odom_fault_events
+
+# Pose-source freshness uses the ROS clock, independently of IMU progression.
+bool pose_input_enabled
+bool pose_available
+float64 pose_age_sec
+uint64 received_pose_measurements
+uint64 received_twist_measurements
+
+# Activation gates sensor processing and state/TF output.
+bool active

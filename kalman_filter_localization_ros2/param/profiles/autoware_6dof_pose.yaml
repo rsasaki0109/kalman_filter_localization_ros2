@@ -1,0 +1,26 @@
+# Pose-input development profile; full Autoware replacement services and twist
+# measurement fusion are separate milestones. Supply calibrated IMU noise values.
+ekf_localization:
+  ros__parameters:
+    reference_frame_id: map
+    robot_frame_id: base_link
+    imu_topic: /imu/data
+    initial_pose_covariance_topic: initialpose
+    initial_pose_covariance_mode: full
+    pose_measurement_topic: measured_pose_with_covariance
+    max_pose_nis: 16.812  # chi-square 99% threshold, 6 degrees of freedom
+    output_publish_mode: imu
+    output_stamp_source: imu
+    input_qos_depth: 100
+    output_qos_depth: 100
+    propagation_model: fast
+    use_flat_ground: false
+    use_imu_orientation: false
+    use_nonholonomic_constraint: false
+    use_wheel_speed: false
+    use_odom: false
+    use_gnss: false
+    enable_measurement_replay: true
+    measurement_history_duration_sec: 2.0
+    max_future_measurement_wait_sec: 0.2
+    publish_tf: false
