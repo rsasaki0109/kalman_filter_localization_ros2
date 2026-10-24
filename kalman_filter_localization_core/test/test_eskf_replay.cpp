@@ -218,7 +218,9 @@ TEST(EskfReplay, QueuesMeasurementThatArrivesBeforeFirstImu)
     EskfReplay::Status::kQueuedFuture);
   EXPECT_EQ(
     replay.addImu(
-      0.01, Eigen::Vector3d::Zero(), Eigen::Vector3d(0.0, 0.0, 9.80665)),
+      // Arrival order may differ, but the queued observation must be inside
+      // the history established by this first IMU (the same stamp is valid).
+      0.0, Eigen::Vector3d::Zero(), Eigen::Vector3d(0.0, 0.0, 9.80665)),
     EskfReplay::Status::kInitialized);
   EXPECT_EQ(replay.counters().measurements_applied, 1U);
   EXPECT_GT(estimator.getPosition().x(), 0.0);
@@ -311,4 +313,35 @@ TEST(EkfSnapshot, InvalidRestoreDoesNotMutateEstimator)
   EXPECT_FALSE(estimator.restoreSnapshot(invalid));
   EXPECT_LT((estimator.getX() - EKFEstimator().getX()).norm(), 1.0e-15);
   EXPECT_LT((estimator.getCovariance() - before.covariance).norm(), 1.0e-15);
+}
+
+TEST(EskfReplay, StartupQueueRejectsObservationsBeforeFirstImuAnchor)
+{
+  EKFEstimator estimator;
+  EskfReplay replay(estimator, 2.0);
+  int updates = 0;
+  const auto update = [&updates](EKFEstimator & target) {
+      ++updates;
+      return target.observationUpdateWithStatus(
+        Eigen::Vector3d::Ones(), Eigen::Vector3d::Ones());
+    };
+  ASSERT_EQ(replay.applyMeasurement(0.5, 0.5, 1U, update), EskfReplay::Status::kQueuedFuture);
+  ASSERT_EQ(replay.addImu(1.0, Eigen::Vector3d::Zero(), Eigen::Vector3d(0, 0, 9.80665)),
+    EskfReplay::Status::kInitialized);
+  EXPECT_EQ(updates, 0);
+  EXPECT_EQ(replay.counters().too_old, 1U);
+  EXPECT_EQ(replay.counters().measurements_applied, 0U);
+  EXPECT_TRUE(estimator.getPosition().isZero(0.0));
+  // Delivering the same observation after the anchor has identical semantics.
+  EXPECT_EQ(replay.applyMeasurement(0.5, 1.0, 1U, update), EskfReplay::Status::kTooOld);
+  EXPECT_EQ(updates, 0);
+
+  EKFEstimator at_anchor;
+  EskfReplay anchor_replay(at_anchor, 2.0);
+  ASSERT_EQ(anchor_replay.applyMeasurement(1.0, 0.5, 2U, update),
+    EskfReplay::Status::kQueuedFuture);
+  ASSERT_EQ(anchor_replay.addImu(1.0, Eigen::Vector3d::Zero(), Eigen::Vector3d(0, 0, 9.80665)),
+    EskfReplay::Status::kInitialized);
+  EXPECT_EQ(updates, 1);
+  EXPECT_GT(at_anchor.getPosition().norm(), 0.0);
 }

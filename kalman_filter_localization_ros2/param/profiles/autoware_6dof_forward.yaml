@@ -1,0 +1,32 @@
+# Forward-speed profile: lateral/vertical Twist values are unobserved.
+# Pose + linear-Twist development profile. Angular propagation uses the IMU;
+# Twist angular values only transport an offset source's velocity to base_link.
+# Calibrate noise/extrinsics and supply stack-specific output remappings.
+ekf_localization:
+  ros__parameters:
+    reference_frame_id: map
+    robot_frame_id: base_link
+    imu_topic: /imu/data
+    initial_pose_covariance_topic: initialpose
+    initial_pose_covariance_mode: full
+    pose_measurement_topic: measured_pose_with_covariance
+    pose_measurement_timeout_sec: 1.0
+    max_pose_nis: 16.812
+    twist_measurement_topic: measured_twist_with_covariance
+    twist_linear_axes: [x]
+    max_twist_nis: 6.635  # chi-square 99%, one observed axis
+    output_publish_mode: imu
+    output_stamp_source: imu
+    input_qos_depth: 100
+    output_qos_depth: 100
+    propagation_model: fast
+    use_flat_ground: false
+    use_imu_orientation: false
+    use_nonholonomic_constraint: false
+    use_wheel_speed: false
+    use_odom: false
+    use_gnss: false
+    enable_measurement_replay: true
+    measurement_history_duration_sec: 2.0
+    max_future_measurement_wait_sec: 0.2
+    publish_tf: false

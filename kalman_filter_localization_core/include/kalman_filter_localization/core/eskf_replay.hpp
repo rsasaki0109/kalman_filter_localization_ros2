@@ -424,6 +424,14 @@ private:
     {
       MeasurementEvent event = std::move(pending_measurements_.front());
       pending_measurements_.erase(pending_measurements_.begin());
+      // Before the first IMU there is no time anchor. Once it exists, apply
+      // the same history boundary as applyMeasurement() instead of silently
+      // applying an older queued observation at the first IMU's time.
+      if (event.time < imu_samples_.front().time - 1.0e-12) {
+        ++counters_.too_old;
+        measurement_ids_.erase(event.id);
+        continue;
+      }
       const auto position = std::lower_bound(
         measurements_.begin(), measurements_.end(), event,
         [](const MeasurementEvent & left, const MeasurementEvent & right) {

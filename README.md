@@ -1,7 +1,19 @@
 # Kalman Filter Localization
 
-A GNSS/IMU/odometry error-state EKF for ROS 2. It estimates position, velocity,
+![Real UrbanNav Odaiba GNSS, IMU and wheel-speed data replayed through the ROS 2 ESKF](images/hero_localization_real.gif)
+
+*Real UrbanNav Odaiba data (MIT) · actual ROS 2 output · reference-seeded initialization.*
+[Reproduce the real-data demo](demos/real_data_hero/README.md) · [Full measured results and assumptions](demos/real_data_hero/published_metrics.json) · [Synthetic 6DoF demo](demos/hero_6dof/README.md)
+
+A 6DoF error-state EKF for ROS 2, fusing IMU, absolute pose and velocity
+observations, with GNSS and odometry input modes. It estimates position, velocity,
 attitude, and IMU biases.
+
+Development target: a general 6DoF localizer for **Autoware and Nav2**.
+See the [integration contracts and roadmap](docs/autoware_nav2.md) for current
+capabilities, TF ownership and remaining replacement requirements.
+[Autoware/Nav2 launch and activation](docs/stack_launch.md) provides runnable
+entry points with topic/service remappings and startup instructions.
 
 ![Localization pipeline](docs/images/localization_pipeline.svg)
 
@@ -29,10 +41,15 @@ Main topics:
 | Direction | Topic | Type |
 |---|---|---|
 | input | `/ekf_localization/initial_pose` | `geometry_msgs/PoseStamped` |
+| input (optional, configured) | `pose_measurement_topic` | `geometry_msgs/PoseWithCovarianceStamped` |
+| input (optional, configured) | `twist_measurement_topic` | `geometry_msgs/TwistWithCovarianceStamped` |
 | input | `/gnss_pose` | `geometry_msgs/PoseStamped` |
 | input | `/sensing/imu/imu_data` | `sensor_msgs/Imu` |
 | input | `/wheel_speed` (optional) | `geometry_msgs/TwistWithCovarianceStamped` |
 | output | `/ekf_localization/current_pose` | `geometry_msgs/PoseStamped` |
+| output | `/ekf_localization/current_pose_with_covariance` | `geometry_msgs/PoseWithCovarianceStamped` |
+| output | `/ekf_localization/current_twist` | `geometry_msgs/TwistStamped` |
+| output | `/ekf_localization/current_twist_with_covariance` | `geometry_msgs/TwistWithCovarianceStamped` |
 | output | `/ekf_localization/current_odometry` | `nav_msgs/Odometry` |
 
 Health and typed diagnostics are always published:
@@ -51,6 +68,16 @@ separate [`kalman_filter_localization_msgs`](kalman_filter_localization_msgs)
 package and are intended for monitoring tools and long-term API use. Detailed
 field definitions and health-state transitions are in
 [`docs/diagnostics.md`](docs/diagnostics.md).
+
+An optional [joint 6DoF pose input](docs/pose_measurements.md) preserves correlated
+position/attitude covariance, transforms reference frames at the sensor timestamp,
+and supports delayed replay and six-dimensional NIS gating.
+The [linear Twist input](docs/twist_measurements.md) adds correlated 3D velocity
+observations with sensor-origin transport and replay. Pose freshness is monitored
+independently of IMU arrival.
+Twist axes can be selected for forward-speed-only inputs. See
+[initialization and reset](docs/initialization_reset.md) for full correlated
+initial covariance and the reset service.
 
 See [`ekf.yaml`](kalman_filter_localization_ros2/param/ekf.yaml) for the default
 parameters and [`param/profiles`](kalman_filter_localization_ros2/param/profiles) for

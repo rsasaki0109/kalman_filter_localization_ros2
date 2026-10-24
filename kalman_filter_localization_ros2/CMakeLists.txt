@@ -50,6 +50,11 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_evaluate_localization test/test_evaluate_localization.py)
   ament_add_pytest_test(test_typed_messages test/test_typed_messages.py)
   ament_add_pytest_test(test_kf_doctor test/test_kf_doctor.py)
+  ament_add_pytest_test(test_state_output_ros test/test_state_output_ros.py TIMEOUT 90)
+  ament_add_pytest_test(test_pose_input_ros test/test_pose_input_ros.py TIMEOUT 90)
+  ament_add_pytest_test(test_twist_input_ros test/test_twist_input_ros.py TIMEOUT 90)
+  ament_add_pytest_test(test_integration_launch_ros test/test_integration_launch_ros.py TIMEOUT 90)
+  ament_add_pytest_test(test_initialization_ros test/test_initialization_ros.py TIMEOUT 90)
 endif()
 
 add_library(ekf_localization_component SHARED
