@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>kalman_filter_localization</name>
-  <version>0.0.0</version>
+  <version>0.3.0</version>
   <description>ros2  package of Kalman Filter Based Localization</description>
   <maintainer email="rsasaki0109@gmail.com">sasaki</maintainer>
   <license>BSD-3-Clause</license>
